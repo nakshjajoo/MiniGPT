@@ -115,7 +115,7 @@ class GPT(nn.Module):
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # (B*T, vocab_size) - flatten the batch and time dimensions for F.cross_entropy
         return logits, loss
 
     @classmethod
@@ -174,13 +174,11 @@ class GPT(nn.Module):
 
 #autodetect the best available device
 device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = "mps"
+# if torch.cuda.is_available():
+#     device = "cuda"
+# elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+#     device = "mps"
 print(f"Using device: {device}")
-
-device = 'cpu' #override for debugging
 
 #get a data batch
 enc = tiktoken.get_encoding("gpt2")
@@ -190,6 +188,7 @@ text = text[:1000]
 tokens = enc.encode(text)
 B, T = 4, 32
 buf = torch.tensor(tokens[:B*T + 1])
+buf = buf.to(device)
 x = buf[:-1].view(B, T) # (B, T)
 y = buf[1:].view(B, T) # (B, T)
 
@@ -198,9 +197,17 @@ y = buf[1:].view(B, T) # (B, T)
 model = GPT(GPTConfig())
 model.eval()
 model.to(device)
-logits, loss = model(x)
+# logits, loss = model(x, y)
 
-print(logits.shape) 
+#optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x.to(device), y.to(device))
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
 sys.exit(0)
 
 num_return_sequences = 5
