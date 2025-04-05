@@ -16,6 +16,9 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        self.c_proj.MINIGPT_SCALE_INIT = 1
+
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -55,6 +58,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.MINIGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -99,7 +103,20 @@ class GPT(nn.Module):
 
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight # share the weights between the token embedding and the output layer
-    
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear): 
+            std = 0.02
+            if hasattr(module, 'MINIGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # 0.02 is roughly the same as what we get if we use Xavier initialization (1/sqrt(n_embd))
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
