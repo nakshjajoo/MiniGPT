@@ -171,18 +171,27 @@ class GPT(nn.Module):
 
 
 
-num_return_sequences = 5
-max_length = 50
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = "mps"
 
-model = GPT.from_pretrained('gpt2')
+print(f"Using device: {device}")
+
+num_return_sequences = 5
+max_length = 100
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 model.eval()
-model.to('mps')
+model.to(device)
 
 enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I am a language model,")
+tokens = enc.encode("The transformer is a deep learning architecture")
 tokens = torch.tensor(tokens, dtype=torch.long) # (T,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_return_sequences, T)
-x = tokens.to('mps')
+x = tokens.to(device)
 
 #generation: initially, x is (B, T)
 torch.manual_seed(42)
@@ -209,3 +218,4 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
+    print()
