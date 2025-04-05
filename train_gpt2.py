@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
+import tiktoken
 
 class CausalSelfAttention(nn.Module):
 
@@ -95,6 +96,27 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
+
+    def forward(self, idx, targets=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb # (B, T, n_embd)
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x) # (B, T, n_embd)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -146,7 +168,44 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    
+
+
+
+num_return_sequences = 5
+max_length = 50
+
 model = GPT.from_pretrained('gpt2')
-print(model)
-print('didnt crash')
+model.eval()
+model.to('mps')
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I am a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (T,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_return_sequences, T)
+x = tokens.to('mps')
+
+#generation: initially, x is (B, T)
+torch.manual_seed(42)
+torch.mps.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits, loss = model(x) # (B, T, vocab_size)
+        #take the last token logits
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get the probs
+        probs = F.softmax(logits, dim=-1) # (B, vocab_size)
+        # do a top-k sampling of 50
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50), (B, 50)
+        # sample from the topk probs
+        ix = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
+        # gather the indices from the topk_indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        # append the sampled token to the input
+        x = torch.cat((x, xcol), dim=1) # (B, T+1)
+
+# decode the tokens and print
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
