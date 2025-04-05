@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import sys
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -171,21 +172,40 @@ class GPT(nn.Module):
 
 
 
+#autodetect the best available device
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = "mps"
-
 print(f"Using device: {device}")
 
-num_return_sequences = 5
-max_length = 100
+device = 'cpu' #override for debugging
 
+#get a data batch
+enc = tiktoken.get_encoding("gpt2")
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T) # (B, T)
+y = buf[1:].view(B, T) # (B, T)
+
+#get logits
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 model.eval()
 model.to(device)
+logits, loss = model(x)
+
+print(logits.shape) 
+sys.exit(0)
+
+num_return_sequences = 5
+max_length = 100
+
 
 enc = tiktoken.get_encoding("gpt2")
 tokens = enc.encode("The transformer is a deep learning architecture")
