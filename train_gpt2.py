@@ -227,9 +227,11 @@ class GPT(nn.Module):
         
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
     
         # at init, load tokens from disk and store in memory
         with open('input.txt', 'r') as f:
@@ -240,7 +242,7 @@ class DataLoaderLite:
         print(f"loaded {len(self.tokens)} tokens from disk")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -248,10 +250,10 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T) # (B, T)
         y = buf[1:].view(B, T) # (B, T)
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would exceed the number of tokens, reset the position
-        if self.current_position + (B * T + 1) >= len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 # Setting up DDP
@@ -298,17 +300,17 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"gradient accumulation steps: {grad_accum_steps}")
 
-print("I am gpu", ddp_rank)
-import sys; sys.exit(0)
-
 # adding fake tokens at the which would never be used by making the vocab size "a nicer number" (50,257 -> 50,304)
 # this is not necessary, but it makes the model run faster on CUDA
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
 model = torch.compile(model)
+# if using ddp, wrap the model in DDP
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
-train_loader = DataLoaderLite(B=8, T=1024)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 torch.set_float32_matmul_precision('high')
 
 max_lr = 6e-4
@@ -350,8 +352,15 @@ for step in range(50):
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN. Scale the loss here so simulate the mean reduction
         loss = loss / grad_accum_steps
-        loss_accum += loss.detach() 
-        loss.backward() #since we are not doing torch.zero_grad, this accumulates the gradients
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # only sync gradients on the last micro step
+        loss.backward() #since we are not doing torch.zero_grad(), this accumulates the gradients
+
+    if ddp:
+        # sync the gradients across all processes
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        # loss_accum is now the average loss across all processes
 
     # clip the gradients to avoid exploding gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -363,9 +372,14 @@ for step in range(50):
     torch.cuda.synchronize() if device == "cuda" else None
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
-    tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
+    tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps * ddp_world_size # number of tokens processed in this step
     tokens_per_sec = tokens_processed / dt # tokens per second
-    print(f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} s | tokens/sec: {tokens_per_sec:.2f}")
+    if master_process:
+        print(f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} s | tokens/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    # destroy the process group
+    destroy_process_group()
 
 sys.exit(0)
 
