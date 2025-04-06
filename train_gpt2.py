@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
 import tiktoken
+import time
 
 class CausalSelfAttention(nn.Module):
 
@@ -220,10 +221,10 @@ class DataLoaderLite:
 
 #autodetect the best available device
 device = "cpu"
-# if torch.cuda.is_available():
-#     device = "cuda"
-# elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-#     device = "mps"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = "mps"
 print(f"Using device: {device}")
 
 #get logits
@@ -232,18 +233,22 @@ model.eval()
 model.to(device)
 
 #get a data batch
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=16, T=1024)
 
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch() # (B, T)
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x.to(device), y.to(device))
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() if device == "cuda" else None
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # convert to ms
+    print(f"step {i}, loss: {loss.item()} dt: {dt:.2f}ms")
 
 sys.exit(0)
 
