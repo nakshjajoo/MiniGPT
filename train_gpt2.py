@@ -239,14 +239,32 @@ model.eval()
 model.to(device)
 model = torch.compile(model)
 
-#get a data batch
 train_loader = DataLoaderLite(B=8, T=1024)
-
 torch.set_float32_matmul_precision('high')
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1 # 10% of max_lr
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(iter):
+    # Linear warmup for warmup_steps steps
+    if iter < warmup_steps:
+        return max_lr * (iter + 1) / warmup_steps
+    
+    # after max_steps, return min learning rate
+    if iter > max_steps:
+        return min_lr
+
+    # Cosine decay for the rest of the steps in the middle
+    decay_ratio = (iter - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio)) # coefficient goes from 1 to 0
+    return min_lr + (max_lr - min_lr) * coeff
 
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(50):
+for step in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch() # (B, T)
     x, y = x.to(device), y.to(device)
@@ -257,12 +275,16 @@ for i in range(50):
     loss.backward()
     # clip the gradients to avoid exploding gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # use the scheduler to determine the learning rate for this step
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize() if device == "cuda" else None
     t1 = time.time()
     dt = (t1 - t0) * 1000 # convert to ms
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) # tokens per second
-    print(f"step {i} | loss: {loss.item()} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+    print(f"step {step} | loss: {loss.item()} | lr: {lr:.4e} norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
