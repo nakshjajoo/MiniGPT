@@ -47,7 +47,7 @@ class CausalSelfAttention(nn.Module):
         # att = F.softmax(att, dim=-1)
         # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
 
-        # Use flash attention instead of manually calculating the attention
+        # Use flash attention instead of manually calculating the attention, avoid materializing the large (T, T) matrix (repeated gpu memory read/write)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # (B, nh, T, hs)
         
         # reassemble all head outputs side by side
@@ -232,8 +232,9 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = "mps"
 print(f"Using device: {device}")
 
-#get logits
-model = GPT(GPTConfig())
+# adding fake tokens at the which would never be used by making the vocab size "a nicer number" (50,257 -> 50,304)
+# this is not necessary, but it makes the model run faster on CUDA
+model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
 model = torch.compile(model)
