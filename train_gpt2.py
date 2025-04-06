@@ -235,6 +235,8 @@ model.to(device)
 #get a data batch
 train_loader = DataLoaderLite(B=16, T=1024)
 
+torch.set_float32_matmul_precision('high')
+
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
@@ -248,7 +250,8 @@ for i in range(50):
     torch.cuda.synchronize() if device == "cuda" else None
     t1 = time.time()
     dt = (t1 - t0) * 1000 # convert to ms
-    print(f"step {i}, loss: {loss.item()} dt: {dt:.2f}ms")
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) # tokens per second
+    print(f"step {i}, loss: {loss.item()} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
