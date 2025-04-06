@@ -258,6 +258,15 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = "mps"
 print(f"Using device: {device}")
 
+# gradient accumulation
+total_batch_size = 524288 # 2^19, ~ 0.5M tokens 
+B = 8 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, f"total_batch_size {total_batch_size} must be divisible by B*T {B*T}"
+grad_accum_steps = total_batch_size // (B * T) # number of gradient accumulation steps
+print(f"total desired batch size: {total_batch_size}")
+print(f"gradient accumulation steps: {grad_accum_steps}")
+
 # adding fake tokens at the which would never be used by making the vocab size "a nicer number" (50,257 -> 50,304)
 # this is not necessary, but it makes the model run faster on CUDA
 model = GPT(GPTConfig(vocab_size=50304))
@@ -289,17 +298,27 @@ def get_lr(iter):
     return min_lr + (max_lr - min_lr) * coeff
 
 #optimize
-# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(50):
     t0 = time.time()
-    x, y = train_loader.next_batch() # (B, T)
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x.to(device), y.to(device))
+    loss_accum = 0.0
+
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch() # (B, T)
+        x, y = x.to(device), y.to(device)
+
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x.to(device), y.to(device))
         
-    loss.backward()
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so simulate the mean reduction
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach() 
+        loss.backward() #since we are not doing torch.zero_grad, this accumulates the gradients
+
     # clip the gradients to avoid exploding gradients
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # use the scheduler to determine the learning rate for this step
@@ -309,9 +328,10 @@ for step in range(50):
     optimizer.step()
     torch.cuda.synchronize() if device == "cuda" else None
     t1 = time.time()
-    dt = (t1 - t0) * 1000 # convert to ms
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) # tokens per second
-    print(f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt # tokens per second
+    print(f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
