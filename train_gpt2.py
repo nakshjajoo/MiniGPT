@@ -1,10 +1,14 @@
 from dataclasses import dataclass
 import inspect
 import math
+import os
 import sys
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch import distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import GPT2LMHeadModel
 import tiktoken
 import time
@@ -250,22 +254,52 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
-#autodetect the best available device
-device = "cpu"
+# Setting up DDP
+# torchrun command sets the env vars RANK, LOCAL_RANK and WORLD_SIZE
+# RANK is the global rank of the process, LOCAL_RANK is the local rank of the process on the node, and WORLD_SIZE is the total number of processes
+ddp = int(os.environ.get('RANK', -1)) != -1 # check if this is a distributed run
+
+if ddp:
+    assert torch.cuda.is_available(), "DDP requires CUDA"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # only the master process will do the logging, checkpoints, etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    #autodetect the best available device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"Using device: {device}")
+
+
+torch.manual_seed(1337)
 if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = "mps"
-print(f"Using device: {device}")
+    torch.cuda.manual_seed(1337)
 
 # gradient accumulation
 total_batch_size = 524288 # 2^19, ~ 0.5M tokens 
 B = 8 # micro batch size
 T = 1024 # sequence length
-assert total_batch_size % (B * T) == 0, f"total_batch_size {total_batch_size} must be divisible by B*T {B*T}"
-grad_accum_steps = total_batch_size // (B * T) # number of gradient accumulation steps
-print(f"total desired batch size: {total_batch_size}")
-print(f"gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} must be divisible by B * T * ddp_world_size {B*T*ddp_world_size}"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # number of gradient accumulation steps for each process
+
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"gradient accumulation steps: {grad_accum_steps}")
+
+print("I am gpu", ddp_rank)
+import sys; sys.exit(0)
 
 # adding fake tokens at the which would never be used by making the vocab size "a nicer number" (50,257 -> 50,304)
 # this is not necessary, but it makes the model run faster on CUDA
@@ -331,7 +365,7 @@ for step in range(50):
     dt = t1 - t0 # time difference in seconds
     tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps
     tokens_per_sec = tokens_processed / dt # tokens per second
-    print(f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+    print(f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} s | tokens/sec: {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
