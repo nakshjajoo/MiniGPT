@@ -233,7 +233,7 @@ model.eval()
 model.to(device)
 
 #get a data batch
-train_loader = DataLoaderLite(B=16, T=1024)
+train_loader = DataLoaderLite(B=8, T=1024)
 
 torch.set_float32_matmul_precision('high')
 
@@ -244,7 +244,9 @@ for i in range(50):
     x, y = train_loader.next_batch() # (B, T)
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x.to(device), y.to(device))
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x.to(device), y.to(device))
+        
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize() if device == "cuda" else None
