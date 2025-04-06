@@ -231,6 +231,7 @@ print(f"Using device: {device}")
 model = GPT(GPTConfig())
 model.eval()
 model.to(device)
+model = torch.compile(model)
 
 #get a data batch
 train_loader = DataLoaderLite(B=8, T=1024)
