@@ -306,6 +306,9 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
 model = torch.compile(model)
+
+optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
+
 # if using ddp, wrap the model in DDP
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -333,8 +336,7 @@ def get_lr(iter):
     coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio)) # coefficient goes from 1 to 0
     return min_lr + (max_lr - min_lr) * coeff
 
-#optimize
-optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
+
 for step in range(50):
     t0 = time.time()
     optimizer.zero_grad()
