@@ -14,6 +14,8 @@ from transformers import GPT2LMHeadModel
 import tiktoken
 import time
 
+from hellaswag import iterate_example, render_example
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -273,6 +275,11 @@ class DataLoaderLite:
             self.current_position = self.B * self.T * self.process_rank
         return x, y
 
+
+def get_most_likely_row(tokens, mask, logits):
+    pass
+
+
 # Setting up DDP
 # torchrun command sets the env vars RANK, LOCAL_RANK and WORLD_SIZE
 # RANK is the global rank of the process, LOCAL_RANK is the local rank of the process on the node, and WORLD_SIZE is the total number of processes
@@ -360,11 +367,20 @@ def get_lr(iter):
 optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 enc = tiktoken.get_encoding("gpt2")
 
+# create the log directory we will write checkpoints and log to
+# for train/val loss, and hellaswag eval
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, 'w') as f:
+    pass
+
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1)
 
     # evaluate validation loss once in a while
-    if step % 100 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -381,9 +397,47 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, 'a') as f:
+                f.write(f"step {step} | val_loss: {val_loss_accum.item():.4f}\n")
+    
+    # evaluate hellaswag once in a while
+    if (step % 250 == 0 or last_step) and not use_compile:
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_example("val")):
+            # ensures that each DDP process only evaluates a subset of the validation examples
+            # and that no two processes handle the same example
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into the tokens, mask and label
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+
+            #get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
         
     # generate from the model once in a while (except 0, which is noise)
-    if (step > 0 and step % 100 == 0) and not use_compile:
+    if (step > 0 and step % 250 == 0) and not use_compile:
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -416,7 +470,7 @@ for step in range(max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
-    #training loop
+    #one step of optimization
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -456,47 +510,10 @@ for step in range(max_steps):
     tokens_processed = (train_loader.B * train_loader.T) * grad_accum_steps * ddp_world_size # number of tokens processed in this step
     tokens_per_sec = tokens_processed / dt # tokens per second
     if master_process:
-        print(f"step {step} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} s | tokens/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     # destroy the process group
     destroy_process_group()
-
-sys.exit(0)
-
-num_return_sequences = 5
-max_length = 100
-
-
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("The transformer is a deep learning architecture")
-tokens = torch.tensor(tokens, dtype=torch.long) # (T,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_return_sequences, T)
-x = tokens.to(device)
-
-#generation: initially, x is (B, T)
-torch.manual_seed(42)
-torch.mps.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits, loss = model(x) # (B, T, vocab_size)
-        #take the last token logits
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probs
-        probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-        # do a top-k sampling of 50
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50), (B, 50)
-        # sample from the topk probs
-        ix = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
-        # gather the indices from the topk_indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append the sampled token to the input
-        x = torch.cat((x, xcol), dim=1) # (B, T+1)
-
-# decode the tokens and print
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
-    print()
