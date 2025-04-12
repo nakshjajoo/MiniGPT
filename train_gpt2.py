@@ -99,7 +99,7 @@ class GPTConfig:
     n_embd: int = 768 # embedding dimensionality
     n_layer: int = 12 # number of transformer blocks
     n_head: int = 12 # number of attention heads
-    block_size: int = 1024 # context length
+    block_size: int = 2048 # context length
 
 class GPT(nn.Module):
     def __init__(self, config):
