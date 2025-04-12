@@ -274,9 +274,29 @@ class DataLoaderLite:
             self.current_position = self.B * self.T * self.process_rank
         return x, y
 
-
+""" Helper function for HellaSwag eval; similar to that in hellawag.py """
 def get_most_likely_row(tokens, mask, logits):
-    pass
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    
+    # get the average loss just for the completion region (where mask == 1) in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    
+    # sum and divide by the number of 1s in the mask to get the average loss per token
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 
 # Setting up DDP
@@ -314,8 +334,8 @@ if torch.cuda.is_available():
 
 # gradient accumulation
 total_batch_size = 524288 # 2^19, ~ 0.5M tokens 
-B = 8 # micro batch size
-T = 1024 # sequence length
+B = 4 # micro batch size
+T = 2048 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} must be divisible by B * T * ddp_world_size {B*T*ddp_world_size}"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # number of gradient accumulation steps for each process
 
@@ -343,10 +363,10 @@ train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
 torch.set_float32_matmul_precision('high')
 
-max_lr = 6e-4
+max_lr = 15e-4 # 6e-4
 min_lr = max_lr * 0.1 # 10% of max_lr
 warmup_steps = 715 # 375M tokens / (2^19) tokens per step (375M tokens were used for warmup in the original paper)
-max_steps = 19073 # 10e9 tokens / (2^19) tokens per step
+max_steps = 19073 * 4 # 10e9 tokens / (2^19) tokens per step; 4 epochs
 
 def get_lr(iter):
     # Linear warmup for warmup_steps steps
@@ -398,7 +418,20 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, 'a') as f:
                 f.write(f"step {step} | val_loss: {val_loss_accum.item():.4f}\n")
-    
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # save the model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"checkpoint-{step:05d}.pt")
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": raw_model.config,
+                    "step": step,
+                    "val_loss": val_loss_accum.item(),
+                    "seeds": {"torch": 1337, "generator": 42 + ddp_rank},
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"saved checkpoint to {checkpoint_path}")
+                
     # evaluate hellaswag once in a while
     if (step % 250 == 0 or last_step) and not use_compile:
         num_correct_norm = 0
