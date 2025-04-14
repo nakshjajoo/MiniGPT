@@ -86,7 +86,7 @@ def render_example(example):
     label = example["label"]
     endings = example["endings"]
 
-    # data needed to reproduce this eval on the C size
+    # data needed to reproduce this eval on the C setting (how likely is the model to generate each of the 4 possible endings given the same context)
     data = {
         "label": label,
         "ctx_tokens": None,
@@ -97,11 +97,11 @@ def render_example(example):
     ctx_tokens = enc.encode(ctx)
     data["ctx_tokens"] = ctx_tokens
     token_rows = [] # will eventually be of size (4, T), one for each of the 4 candidate
-    mask_rows = [] # 1s in the ending region, 0s elsewhere
+    mask_rows = [] # 1s in the ending region, 0s elsewhere (in context region and padding)
     for end in endings:
         end_tokens = enc.encode(" " + end) # prefix with space to match GPT2 tokenizer
         token_rows.append(ctx_tokens + end_tokens)
-        mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens)) # 0 for context tokens, 1 for ending tokens
+        mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens)) # 0 for context tokens and padding, 1 for ending tokens
         data["ending_tokens"].append(end_tokens)
     
     # pad all the rows to the same length
