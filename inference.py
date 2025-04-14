@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 import tiktoken
-import time
 import argparse
 import os
 
@@ -14,12 +13,12 @@ def generate_text(model, enc, prompt, device, max_tokens_to_gen):
     model.eval()
 
     prompt_tokens = enc.encode(prompt)
-    x = torch.tensor(prompt_tokens, dtype=torch.long, device=model.device).unsqueeze(0)
+    x = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
     x_len = x.size(1)
     total_len = x_len + max_tokens_to_gen
 
     # for reproducibility
-    sample_rng = torch.Generator(device=model.device)
+    sample_rng = torch.Generator(device=device)
     sample_rng.manual_seed(42)
 
     with torch.no_grad():
@@ -62,11 +61,11 @@ if __name__ == "__main__":
     device_type = "cuda" if device.startswith("cuda") else "cpu"
 
     # Load checkpoint
-    checkpoint_path = os.path.join(log_dir, f"checkpoint-{(max_steps - 1):05d}.pt")
+    checkpoint_path = os.path.join(log_dir, f"checkpoint-00000.pt")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     print(f"Loading model from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Instantiate model
     if 'config' in checkpoint:
@@ -84,6 +83,8 @@ if __name__ == "__main__":
 
     # Prompt for text generation
     prompt = input("Enter your prompt: ")
+    if not prompt or len(prompt) == 0 or prompt.isspace():
+        raise ValueError("Prompt cannot be empty.")
 
     # Generate text
     generated_text = generate_text(model, enc, prompt, device, args.max_tokens)
