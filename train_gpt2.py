@@ -31,7 +31,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        # not really a bias, actually is a attention mask for the causal self-attention, but following OpenAI naming
+        # not really a bias, actually is a attention mask for the causal self-attention, but following GPT2 naming
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                              .view(1, 1, config.block_size, config.block_size)) # (T, T) -> (1, 1, T, T) for broadcasting
 
@@ -41,14 +41,14 @@ class CausalSelfAttention(nn.Module):
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
         qkv = self.c_attn(x) # (B, T, 3 * C)
-        q, k, v = qkv.split(self.n_embd, dim=2) # (B, T, C)
+        q, k, v = qkv.split(self.n_embd, dim=2) # (B, T, C) each
 
         # reshape q, k, v into (B, nh, T, hs) to group all data for a single attention head together
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs).transpose(1, 2) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs).transpose(1, 2) -> (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs).transpose(1, 2) -> (B, nh, T, hs)
         
-        # attention (materializes the large (T, T) matrix for all the queries and keys)
+        # vanilla attention mechanism
         # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         # att = F.softmax(att, dim=-1)
@@ -209,8 +209,8 @@ class GPT(nn.Module):
 
         # create optim groups, any parameters that is 2D will be weight decayed, otherwise not
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for pname, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for pname, p in param_dict.items() if p.dim() < 2]
+        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
@@ -262,7 +262,7 @@ class DataLoaderLite:
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1] # (1 extra token for the next token prediction)
         x = buf[:-1].view(B, T) # (B, T)
         y = buf[1:].view(B, T) # (B, T)
         # advance the position in the tensor
@@ -271,11 +271,13 @@ class DataLoaderLite:
         if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = self.B * self.T * self.process_rank
+            self.current_position = B * T * self.process_rank
         return x, y
 
 """ Helper function for HellaSwag eval; similar to that in hellawag.py """
 def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    # to predict the next token, shift the logits left and the target tokens right to align
     shift_logits = (logits[..., :-1, :]).contiguous()
     shift_tokens = (tokens[..., 1:]).contiguous()
     
@@ -332,9 +334,11 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+
+total_batch_size = 524288 #tokens # 2^19, ~ 0.5M tokens 
+
 # gradient accumulation
-total_batch_size = 524288 # 2^19, ~ 0.5M tokens 
-B = 4 # micro batch size
+B = 4 # micro batch size # bound by the GPU memory
 T = 2048 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, f"total_batch_size {total_batch_size} must be divisible by B * T * ddp_world_size {B*T*ddp_world_size}"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # number of gradient accumulation steps for each process
@@ -343,7 +347,7 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"gradient accumulation steps: {grad_accum_steps}")
 
-# adding fake tokens at the which would never be used by making the vocab size "a nicer number" (50,257 -> 50,304)
+# adding fake tokens at the end which would never be used by making the vocab size "a nicer number" for more efficient GPU computation (50,257 -> 50,304)
 # this is not necessary, but it makes the model run faster on CUDA
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
@@ -456,7 +460,7 @@ for step in range(max_steps):
         
         # reduce the stats across all processes
         if ddp:
-            num_total = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
             num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
             dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
             dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
@@ -475,7 +479,7 @@ for step in range(max_steps):
         max_length = 32
         tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (B, T)
         xgen = tokens.to(device)
         sample_rng = torch.Generator(device=device)
         sample_rng.manual_seed(42 + ddp_rank)
@@ -517,7 +521,7 @@ for step in range(max_steps):
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want MEAN. Scale the loss here so simulate the mean reduction
+        # instead of a SUM we want MEAN. Scale the loss here to simulate the mean reduction
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         if ddp:
