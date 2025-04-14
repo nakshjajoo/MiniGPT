@@ -61,7 +61,7 @@ if __name__ == "__main__":
     device_type = "cuda" if device.startswith("cuda") else "cpu"
 
     # Load checkpoint
-    checkpoint_path = os.path.join(log_dir, f"checkpoint-00000.pt")
+    checkpoint_path = os.path.join(log_dir, f"checkpoint-{(max_steps - 1):05d}.pt")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     print(f"Loading model from {checkpoint_path}")
