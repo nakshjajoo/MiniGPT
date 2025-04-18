@@ -4,17 +4,17 @@ import tiktoken
 import argparse
 import os
 
-from model import GPT, GPTConfig
+from model import GPT
 from training import log_dir, max_steps
 
 def generate_text(model, enc, prompt, device, max_tokens_to_gen):
-    """ Generates text using the GPT model """
+    """ Generates text using the GPT pre-trained model """
 
     model.eval()
 
-    prompt_tokens = enc.encode(prompt)
-    x = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
-    x_len = x.size(1)
+    prompt_tokens = enc.encode(prompt) # (T, C)
+    x = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0) # (B, T, C) where B=1
+    x_len = x.size(1) # T
     total_len = x_len + max_tokens_to_gen
 
     # for reproducibility
@@ -27,6 +27,7 @@ def generate_text(model, enc, prompt, device, max_tokens_to_gen):
             current_block_size = model.config.block_size
             x_cond = x if x.size(1) <= current_block_size else x[:, -current_block_size:]
 
+            # automatic mixed precision
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 logits, _ = model(x_cond) # (B, T, vocab_size)
 
@@ -36,11 +37,17 @@ def generate_text(model, enc, prompt, device, max_tokens_to_gen):
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1) # (B, vocab_size)
 
-            # sample next token
-            ix = torch.multinomial(probs, num_samples=1, generator=sample_rng) # (B, 1)
+            # do a top-k sampling of 50
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50), (B, 50)
 
+            # sample from the topk probs
+            ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng) # (B, 1)
+            
+            # gather the indices from the topk_indices
+            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            
             # append the sampled token to the input
-            x = torch.cat((x, ix), dim=1) # (B, T+1)
+            x = torch.cat((x, xcol), dim=1) # (B, T+1)
 
     generated_tokens = x[0].tolist()
     decoded_text = enc.decode(generated_tokens)
