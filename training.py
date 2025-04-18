@@ -205,7 +205,7 @@ if __name__ == "__main__":
     warmup_steps = 715 # 375M tokens / (2^19) tokens per step (375M tokens were used for warmup in the original paper)
     # max_steps = 19073 * 4 # 10e9 tokens / (2^19) tokens per step; 4 epochs
 
-    optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
     enc = tiktoken.get_encoding("gpt2")
 
 
@@ -257,7 +257,7 @@ if __name__ == "__main__":
                     print(f"saved checkpoint to {checkpoint_path}")
                     
         # evaluate hellaswag once in a while
-        if (step % 250 == 0 or last_step) and not use_compile:
+        if step % 250 == 0 or last_step:
             num_correct_norm = 0
             num_total = 0
             for i, example in enumerate(iterate_example("val")):
@@ -294,7 +294,7 @@ if __name__ == "__main__":
                     f.write(f"{step} hella {acc_norm:.4f}\n")
             
         # generate from the model once in a while (except 0, which is noise)
-        if (step > 0 and step % 250 == 0) and not use_compile:
+        if step > 0 and step % 250 == 0:
             model.eval()
             num_return_sequences = 4
             max_length = 32
