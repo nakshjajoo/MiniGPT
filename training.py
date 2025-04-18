@@ -176,20 +176,25 @@ if __name__ == "__main__":
     # MODEL INIT
     # adding fake tokens at the end which would never be used by making the vocab size "a nicer number" for more efficient GPU computation (50,257 -> 50,304)
     # this is not necessary, but it makes the model run faster on CUDA
-    model = GPT(GPTConfig(vocab_size=50304))
-    model.eval()
-    model.to(device)
+    raw_model = GPT(GPTConfig(vocab_size=50304))
+    raw_model.eval()
+    raw_model.to(device)
+    compiled_model = torch.compile(raw_model)
 
     # torch.compile interferes with HellaSwag eval and Generation
     # due to dynamic operations and control flow such as while loop and torch.multinomial in generation code
-    use_compile = False 
-    if use_compile:
-        model = torch.compile(model)
+    # use_compile = False 
+    # if use_compile:
+    #     model = torch.compile(model)
 
     # if using ddp, wrap the model in DDP
+    # if ddp:
+    #     model = DDP(model, device_ids=[ddp_local_rank])
+    # raw_model = model.module if ddp else model # get the raw model from the DDP wrapper
+
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model # get the raw model from the DDP wrapper
+        compiled_model = DDP(compiled_model, device_ids=[ddp_local_rank])
+    model = compiled_model
 
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
     val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
@@ -200,7 +205,7 @@ if __name__ == "__main__":
     warmup_steps = 715 # 375M tokens / (2^19) tokens per step (375M tokens were used for warmup in the original paper)
     # max_steps = 19073 * 4 # 10e9 tokens / (2^19) tokens per step; 4 epochs
 
-    optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
     enc = tiktoken.get_encoding("gpt2")
 
 
@@ -267,8 +272,9 @@ if __name__ == "__main__":
 
                 #get the logits
                 with torch.no_grad():
+                    # use raw_model for HellaSwag eval
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                        logits, loss = model(tokens)
+                        logits, loss = raw_model(tokens)
                     pred_norm = get_most_likely_row(tokens, mask, logits)
                 num_total += 1
                 num_correct_norm += int(pred_norm == label)
@@ -302,7 +308,7 @@ if __name__ == "__main__":
                 # forward the model to get the logits
                 with torch.no_grad():
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                        logits, loss = model(xgen) # (B, T, vocab_size)
+                        logits, loss = raw_model(xgen) # (B, T, vocab_size)
                     #take the last token logits
                     logits = logits[:, -1, :] # (B, vocab_size)
                     # get the probs
