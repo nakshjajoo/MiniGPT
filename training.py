@@ -29,24 +29,39 @@ class DataLoaderLite:
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.seed = 1337
+        self.split = split
         assert split in {'train', 'val'}
 
         #get the shard filenames
         data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"no shards found for split {split}"
+        all_shards = os.listdir(data_root)
+        all_shards = [s for s in all_shards if split in s]
+        all_shards = sorted(all_shards)
+        all_shards = [os.path.join(data_root, s) for s in all_shards]
+        self.all_shards = all_shards
+        assert len(all_shards) > 0, f"no shards found for split {split}"
         if master_process:
-            print(f"found {len(shards)} shards for split {split}")
-        self.reset()
+            print(f"found {len(all_shards)} shards for split {split}")
         
-    def reset(self):
+        self.epoch = -1
+        self.shards = []
+        
+        self.reset()
+    
+    def start_new_epoch(self):
+        self.epoch += 1
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.shards = list(self.all_shards)
+        rng.shuffle(self.shards)
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
+        if master_process:
+            print(f"[{self.split}] Starting epoch {self.epoch} with shuffled shards.")
+
+    def reset(self):
+        self.start_new_epoch()
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -57,9 +72,14 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_processes
         # if loading the next batch would exceed the number of tokens, advance to next shard
         if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+            # self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.current_shard += 1
+            if self.current_shard_index >= len(self.shards):
+                # All shards used up — next epoch
+                self.start_new_epoch()
+            else:    
+                self.tokens = load_tokens(self.shards[self.current_shard])
+                self.current_position = B * T * self.process_rank
         return x, y
 
 """ Helper function for HellaSwag eval; similar to that in hellawag.py """
