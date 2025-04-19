@@ -9,12 +9,25 @@ from torch import distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
+from datasets import load_dataset
 
 from hellaswag import iterate_example, render_example
 from model import GPT, GPTConfig
 
+# Define special tokens
+USER_TOKEN = "<|USER|>"
+ASSISTANT_TOKEN = "<|ASSISTANT|>"
+END_TOKEN = "<|END|>"
+SPECIAL_TOKENS = [USER_TOKEN, ASSISTANT_TOKEN, END_TOKEN]
+
 log_dir = "log"
 max_steps = 19073 * 4 # 10e9 tokens / (2^19) tokens per step; 4 epochs
+
+# Fine-tuning hyperparameters
+ft_max_steps = 1000
+ft_lr = 3e-5
+ft_batch_size = 8 # micro batch size for fine-tuning
+ft_total_batch_size = 64 # target total batch size for fine-tuning
 
 def load_tokens(filename):
     # load the tokens from a numpy file
@@ -80,9 +93,79 @@ class DataLoaderLite:
             else:    
                 self.tokens = load_tokens(self.shards[self.current_shard])
                 self.current_position = B * T * self.process_rank
+            
+        if len(buf) < B * T + 1:
+            print(f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
+            # Handle this case - advance position past the end
+            self.current_position = len(self.tokens) 
+            return self.next_batch() # Recursively call to advance to the next shard/epoch properly
+    
         return x, y
 
-""" Helper function for HellaSwag eval; similar to that in hellawag.py """
+class FineTuneDataLoader:
+    def __init__(self, B, T, process_rank, num_processes, data):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        # Preprocess and tokenize the data
+        self.tokens = self._prepare_data(data)
+        self.total_size = len(self.tokens)
+        if master_process:
+            print(f"Fine-tuning dataset loaded with {self.total_size} tokens.")
+        # Initialize current position based on rank
+        self.current_position = self.B * self.T * self.process_rank
+
+    def _prepare_data(self, data):
+        all_tokens_list = []
+
+        base_encoding = tiktoken.get_encoding("gpt2")
+        special_tokens = {
+            USER_TOKEN: 50257,
+            ASSISTANT_TOKEN: 50258,
+            END_TOKEN: 50259,
+        }
+
+        custom_encoding = tiktoken.Encoding(
+            name="gpt2_custom",
+            pat_str=base_encoding._pat_str,
+            mergeable_ranks=base_encoding._mergeable_ranks,
+            special_tokens={**base_encoding._special_tokens, **special_tokens},
+        )
+        
+        for example in data:
+            # extract 'chosen' response from the example in the hh-rlhf dataset
+            text = example['chosen']
+            # replace "Human:" and "Assistant:" with special tokens
+            formatted_text = text.replace("\n\nHuman:", f" {USER_TOKEN} ").replace("\n\nAssistant:", f" {ASSISTANT_TOKEN} ").strip()
+            formatted_text += f" {END_TOKEN}" # Add end token to signify end of turn/example
+            
+            # Tokenize the formatted text
+            tokens = custom_encoding.encode(formatted_text, allowed_special='all')
+            
+            all_tokens_list.extend(tokens)
+
+        # Convert to torch tensor
+        tokens_tensor = torch.tensor(all_tokens_list, dtype=torch.long)
+        return tokens_tensor
+    
+    # TO CHECK
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1] # (1 extra token for the next token prediction)
+        x = buf[:-1].view(B, T) # (B, T)
+        y = buf[1:].view(B, T) # (B, T)
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would exceed the number of tokens, stop
+        if self.current_position + (B * T * self.num_processes + 1) >= self.total_size:
+            # reset the position for the next epoch
+            self.current_position = self.B * self.T * self.process_rank
+        
+        return x, y
+
+
+""" Helper function for HellaSwag eval; similar to that in hellaswag.py """
 def get_most_likely_row(tokens, mask, logits):
     # evaluate the autoregressive loss at all positions
     # to predict the next token, shift the logits left and the target tokens right to align
@@ -101,7 +184,9 @@ def get_most_likely_row(tokens, mask, logits):
     
     # sum and divide by the number of 1s in the mask to get the average loss per token
     sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    non_zero_mask_sum = shift_mask.sum(dim=1)
+    non_zero_mask_sum = torch.where(non_zero_mask_sum == 0, torch.ones_like(non_zero_mask_sum), non_zero_mask_sum)
+    avg_loss = sum_loss / non_zero_mask_sum
     
     # now we have a loss for each of the 4 completions
     # the one with the lowest loss should be the most likely
@@ -156,9 +241,9 @@ if __name__ == "__main__":
             device = "cuda"
         print(f"Using device: {device}")
 
-    torch.manual_seed(1337)
+    torch.manual_seed(1337 + ddp_rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(1337)
+        torch.cuda.manual_seed(1337 + ddp_rank)
 
     # Hyperparameters
     total_batch_size = 524288 #tokens # 2^19, ~ 0.5M tokens 
@@ -179,19 +264,12 @@ if __name__ == "__main__":
     raw_model = GPT(GPTConfig(vocab_size=50304))
     raw_model.eval()
     raw_model.to(device)
-    compiled_model = torch.compile(raw_model)
 
     # torch.compile interferes with HellaSwag eval and Generation
     # due to dynamic operations and control flow such as while loop and torch.multinomial in generation code
-    # use_compile = False 
-    # if use_compile:
-    #     model = torch.compile(model)
+    compiled_model = torch.compile(raw_model)
 
     # if using ddp, wrap the model in DDP
-    # if ddp:
-    #     model = DDP(model, device_ids=[ddp_local_rank])
-    # raw_model = model.module if ddp else model # get the raw model from the DDP wrapper
-
     if ddp:
         compiled_model = DDP(compiled_model, device_ids=[ddp_local_rank])
     model = compiled_model
@@ -203,19 +281,16 @@ if __name__ == "__main__":
     max_lr = 15e-4 # 6e-4
     min_lr = max_lr * 0.1 # 10% of max_lr
     warmup_steps = 715 # 375M tokens / (2^19) tokens per step (375M tokens were used for warmup in the original paper)
-    # max_steps = 19073 * 4 # 10e9 tokens / (2^19) tokens per step; 4 epochs
 
     optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
     enc = tiktoken.get_encoding("gpt2")
-
 
     # create the log directory we will write checkpoints and log to
     # for train/val loss, and hellaswag eval
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
-    with open(log_file, 'w') as f:
+    with open(log_file, 'w') as f: # open for writing to clear the file
         pass
-
 
     # Training loop
     for step in range(max_steps):
@@ -295,7 +370,7 @@ if __name__ == "__main__":
             
         # generate from the model once in a while (except 0, which is noise)
         if step > 0 and step % 250 == 0:
-            model.eval()
+            raw_model.eval()
             num_return_sequences = 4
             max_length = 32
             tokens = enc.encode("Hello, I'm a language model,")
@@ -370,6 +445,135 @@ if __name__ == "__main__":
             print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+    if ddp:
+        dist.barrier()
+    
+    # FINE TUNING
+    if master_process:
+        print("\n--- Starting Fine-tuning Phase ---")
+
+    # Loading the fine-tuning dataset
+    ft_dataset_train = None
+    ft_dataset_val = None
+    # Load dataset only on master process initially to avoid multiple downloads/cache issues
+    if master_process:
+        print("Loading Anthropic/hh-rlhf dataset...")
+        ft_dataset_train = load_dataset("Anthropic/hh-rlhf", split="train[:80%]")
+        ft_dataset_val = load_dataset("Anthropic/hh-rlhf", split="train[80%:]")
+        print("Dataset loaded by master process.")
+        # Simple broadcast of the dataset object size to check consistency
+        dataset_size = len(ft_dataset_train) if ft_dataset_train else 0
+        broadcast_obj = [dataset_size]
+    else:
+        broadcast_obj = [0]
+
+    if ddp:
+        # Broadcast the dataset size from master (rank 0) to all other processes
+        dist.broadcast_object_list(broadcast_obj, src=0)
+        dataset_size_from_master = broadcast_obj[0]
+        if master_process: print(f"Broadcasted dataset size: {dataset_size_from_master}")
+
+        # Non-master processes load from cache
+        if not master_process and dataset_size_from_master > 0:
+            try:
+                print(f"Rank {ddp_rank} loading dataset from cache...")
+                ft_dataset_train = load_dataset("Anthropic/hh-rlhf", split="train[:80%]") # Use same split as master process
+                ft_dataset_val = load_dataset("Anthropic/hh-rlhf", split="train[80%:]")
+                # print(f"Rank {ddp_rank} loaded dataset from cache (size: {len(ft_dataset_train)}).")
+                if len(ft_dataset_train) != dataset_size_from_master:
+                    print(f"Rank {ddp_rank} Warning: Loaded dataset size ({len(ft_dataset_train)}) differs from master ({dataset_size_from_master})!")
+                    ft_dataset_train = None # Consider it failed if size mismatch
+            except Exception as e:
+                print(f"Rank {ddp_rank} failed to load dataset from cache: {e}.")
+                ft_dataset_train = None
+
+        elif not master_process and dataset_size_from_master == 0:
+            print(f"Rank {ddp_rank}: Master process reported empty dataset. Skipping load.")
+            ft_dataset_train = None
+
+        # Final check: Ensure all processes have a valid dataset object
+        can_finetune = ft_dataset_train is not None
+        load_success_tensor = torch.tensor(1 if can_finetune else 0, device=device)
+        dist.all_reduce(load_success_tensor, op=dist.ReduceOp.MIN) # If any failed (0), result is 0
+        if load_success_tensor.item() == 0:
+            if master_process: print("Dataset loading failed or inconsistent across processes. Skipping fine-tuning.")
+            can_finetune = False
+        else:
+            if master_process: print("Dataset successfully loaded on all processes.")
+            can_finetune = True
+    else:
+        # Non-DDP case
+        can_finetune = ft_dataset_train is not None
+    
+    if can_finetune:
+        # Setting up fine-tuning Dataloader
+        ft_B = ft_batch_size
+        assert total_batch_size % (ft_B * T * ddp_world_size) == 0, f"ft_total_batch_size {ft_total_batch_size} must be divisible by ft_B * T * ddp_world_size {ft_B*T*ddp_world_size}"
+        ft_grad_accum_steps = total_batch_size // (ft_B * T * ddp_world_size)
+
+        ft_loader_train = FineTuneDataLoader(B=ft_B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, data=ft_dataset_train)
+        ft_loader_val = FineTuneDataLoader(B=ft_B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, data=ft_dataset_val)
+        torch.set_float32_matmul_precision('high')
+    
+        optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=ft_lr, device=device)
+        
+        ft_log_file = os.path.join(log_dir, f"log.txt")
+        with open(ft_log_file, 'w') as f:
+            f.write("\n\n")
+        
+        for ft_step in range(ft_max_steps):
+            t0 = time.time()
+            model.train()
+            optimizer.zero_grad()
+            loss_accum = 0.0
+
+            for micro_step in range(ft_grad_accum_steps):
+                x, y = ft_loader_train.next_batch()
+                x, y = x.to(device), y.to(device)
+
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x.to(device), y.to(device))
+
+                # scale the loss to account for gradient accumulation
+                loss = loss / ft_grad_accum_steps
+                loss_accum += loss.detach()
+                if ddp:
+                    model.require_backward_grad_sync = (micro_step == ft_grad_accum_steps - 1) # only sync gradients on the last micro step
+                loss.backward()
+                
+                if ddp:
+                    # sync the gradients across all processes
+                    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                ft_current_lr = optimizer.param_groups[0]['lr']
+                optimizer.step()
+                
+                torch.cuda.synchronize() if device == "cuda" else None
+                t1 = time.time()
+                dt = t1 - t0 # time difference in seconds
+                tokens_processed = (ft_loader_train.B * ft_loader_train.T) * grad_accum_steps * ddp_world_size # number of tokens processed in this step
+                tokens_per_sec = tokens_processed / dt # tokens per second
+                if master_process:
+                    print(f"FT step {ft_step:5d} | loss: {loss_accum.item():.6f} | lr {ft_current_lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+                    with open(log_file, "a") as f:
+                        f.write(f"{ft_step} ft_train {loss_accum.item():.6f}\n")
+
+        # Saving the fine-tuned model
+        if master_process:
+            print("\n--- Fine-tuning Finished ---")
+            final_ft_path = os.path.join(log_dir, "finetuned_final.pt")
+            final_ft_checkpoint = {
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": raw_model.config,
+                "step": step,
+                # "val_loss": val_loss_accum.item(),
+                "seeds": {"torch": 1337, "generator": 42 + ddp_rank},
+            }
+            torch.save(final_ft_checkpoint, final_ft_path)
+            print(f"saved fine-tuned model to {final_ft_path}")
 
     if ddp:
         # destroy the process group
