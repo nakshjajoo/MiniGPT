@@ -24,7 +24,7 @@ log_dir = "log"
 max_steps = 19073 * 4 # 10e9 tokens / (2^19) tokens per step; 4 epochs
 
 # Fine-tuning hyperparameters
-ft_max_steps = 1000
+ft_max_steps = 2000
 ft_lr = 3e-5
 ft_batch_size = 8 # micro batch size for fine-tuning
 ft_total_batch_size = 64 # target total batch size for fine-tuning
@@ -519,7 +519,7 @@ if __name__ == "__main__":
         optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=ft_lr, device=device)
         
         ft_log_file = os.path.join(log_dir, f"log.txt")
-        with open(ft_log_file, 'w') as f:
+        with open(ft_log_file, 'a') as f:
             f.write("\n\n")
         
         for ft_step in range(ft_max_steps):
@@ -542,23 +542,23 @@ if __name__ == "__main__":
                     model.require_backward_grad_sync = (micro_step == ft_grad_accum_steps - 1) # only sync gradients on the last micro step
                 loss.backward()
                 
-                if ddp:
-                    # sync the gradients across all processes
-                    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            if ddp:
+                # sync the gradients across all processes
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                ft_current_lr = optimizer.param_groups[0]['lr']
-                optimizer.step()
-                
-                torch.cuda.synchronize() if device == "cuda" else None
-                t1 = time.time()
-                dt = t1 - t0 # time difference in seconds
-                tokens_processed = (ft_loader_train.B * ft_loader_train.T) * grad_accum_steps * ddp_world_size # number of tokens processed in this step
-                tokens_per_sec = tokens_processed / dt # tokens per second
-                if master_process:
-                    print(f"FT step {ft_step:5d} | loss: {loss_accum.item():.6f} | lr {ft_current_lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-                    with open(log_file, "a") as f:
-                        f.write(f"{ft_step} ft_train {loss_accum.item():.6f}\n")
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            ft_current_lr = optimizer.param_groups[0]['lr']
+            optimizer.step()
+            
+            torch.cuda.synchronize() if device == "cuda" else None
+            t1 = time.time()
+            dt = t1 - t0 # time difference in seconds
+            tokens_processed = (ft_loader_train.B * ft_loader_train.T) * grad_accum_steps * ddp_world_size # number of tokens processed in this step
+            tokens_per_sec = tokens_processed / dt # tokens per second
+            if master_process:
+                print(f"FT step {ft_step:5d} | loss: {loss_accum.item():.6f} | lr {ft_current_lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{ft_step} ft_train {loss_accum.item():.6f}\n")
 
         # Saving the fine-tuned model
         if master_process:
