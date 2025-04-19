@@ -524,6 +524,67 @@ if __name__ == "__main__":
         
         for ft_step in range(ft_max_steps):
             t0 = time.time()
+            last_step = (ft_step == ft_max_steps - 1)
+
+            # evaluate validation loss once in a while
+            if ft_step % 10 == 0 or last_step:
+                model.eval()
+                val_loader.reset()
+                with torch.no_grad():
+                    val_loss_accum = 0.0
+                    val_loss_steps = 20
+                    for _ in range(val_loss_steps):
+                        x, y = val_loader.next_batch()
+                        x, y = x.to(device), y.to(device)
+                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                            logits, loss = model(x, y)
+                        loss = loss / val_loss_steps
+                        val_loss_accum += loss.detach()
+                if ddp:
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+                if master_process:
+                    print(f"fine-tuning validation loss: {val_loss_accum.item():.4f}")
+                    with open(ft_log_file, 'a') as f:
+                        f.write(f"ft_step {ft_step} | ft_val_loss: {val_loss_accum.item():.4f}\n")
+            
+            # evaluate hellaswag once in a while
+            if ft_step % 10 == 0 or last_step:
+                num_correct_norm = 0
+                num_total = 0
+                for i, example in enumerate(iterate_example("val")):
+                    # ensures that each DDP process only evaluates a subset of the validation examples
+                    # and that no two processes handle the same example
+                    if i % ddp_world_size != ddp_rank:
+                        continue
+                    # render the example into the tokens, mask and label
+                    _, tokens, mask, label = render_example(example)
+                    tokens = tokens.to(device)
+                    mask = mask.to(device)
+
+                    #get the logits
+                    with torch.no_grad():
+                        # use raw_model for HellaSwag eval
+                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                            logits, loss = raw_model(tokens)
+                        pred_norm = get_most_likely_row(tokens, mask, logits)
+                    num_total += 1
+                    num_correct_norm += int(pred_norm == label)
+                
+                # reduce the stats across all processes
+                if ddp:
+                    num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                    num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+                    dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                    num_total = num_total.item()
+                    num_correct_norm = num_correct_norm.item()
+                acc_norm = num_correct_norm / num_total
+                if master_process:
+                    print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+                    with open(ft_log_file, "a") as f:
+                        f.write(f"{ft_step} ft_hella {acc_norm:.4f}\n")
+
+
             model.train()
             optimizer.zero_grad()
             loss_accum = 0.0
