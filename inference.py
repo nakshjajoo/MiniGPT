@@ -19,6 +19,7 @@ END_TOKEN_ID = SPECIAL_TOKEN_IDS[END_TOKEN] # # Specific ID for stopping generat
 
 def create_custom_encoding():
     """Creates the tiktoken encoding used during fine-tuning."""
+    
     base_encoding = tiktoken.get_encoding("gpt2")
     # Ensure the special tokens map includes the base special tokens plus our custom ones
     custom_special_tokens = {
@@ -91,54 +92,6 @@ def generate_response(model, enc, history_tokens, device, max_new_tokens=100, te
         
         return generated_sequence
 
-
-# def generate_text(model, enc, prompt, device, max_tokens_to_gen):
-#     """ Generates text using the GPT pre-trained model """
-
-#     model.eval()
-
-#     prompt_tokens = enc.encode(prompt) # (T, C)
-#     x = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0) # (B, T, C) where B=1
-#     x_len = x.size(1) # T
-#     total_len = x_len + max_tokens_to_gen
-
-#     # for reproducibility
-#     sample_rng = torch.Generator(device=device)
-#     sample_rng.manual_seed(42)
-
-#     with torch.no_grad():
-#         while x.size(1) < total_len:
-#             # crop context if it exceeds the model's context length
-#             current_block_size = model.config.block_size
-#             x_cond = x if x.size(1) <= current_block_size else x[:, -current_block_size:]
-
-#             # automatic mixed precision
-#             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-#                 logits, _ = model(x_cond) # (B, T, vocab_size)
-
-#             # get the logits for the last token
-#             logits = logits[:, -1, :] # (B, vocab_size)
-
-#             # apply softmax to get probabilities
-#             probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-
-#             # do a top-k sampling of 50
-#             topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50), (B, 50)
-
-#             # sample from the topk probs
-#             ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng) # (B, 1)
-            
-#             # gather the indices from the topk_indices
-#             xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-            
-#             # append the sampled token to the input
-#             x = torch.cat((x, xcol), dim=1) # (B, T+1)
-
-#     generated_tokens = x[0].tolist()
-#     decoded_text = enc.decode(generated_tokens)
-
-#     return decoded_text
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text using a pre-trained GPT model.")
     parser.add_argument("--max_new_tokens", type=int, default=150, help="Maximum number of new tokens to generate per turn.")
@@ -182,11 +135,6 @@ if __name__ == "__main__":
 
     print("\nStarting conversation (type 'exit' to quit).")
     conversation_history_tokens = [] # Stores token IDs of the full conversation
-
-    # # Prompt for text generation
-    # prompt = input("Enter your prompt: ")
-    # if not prompt or len(prompt) == 0 or prompt.isspace():
-    #     raise ValueError("Prompt cannot be empty.")
 
     while True:
         user_input = input("You: ")
