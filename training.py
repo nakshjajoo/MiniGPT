@@ -57,6 +57,7 @@ class DataLoader:
         assert len(all_shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(all_shards)} shards for split {split}")
+            log_to_file(print_log_file, f"found {len(all_shards)} shards for split {split}")
         
         self.epoch = -1
         self.shards = []
@@ -74,6 +75,7 @@ class DataLoader:
         self.current_position = self.B * self.T * self.process_rank
         if master_process:
             print(f"[{self.split}] Starting epoch {self.epoch} with shuffled shards.")
+            log_to_file(print_log_file, f"[{self.split}] Starting epoch {self.epoch} with shuffled shards.")
 
     def reset(self):
         """ Reset the data loader to the beginning of the dataset """
@@ -100,6 +102,7 @@ class DataLoader:
             
         if len(buf) < B * T + 1:
             print(f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
+            log_to_file(print_log_file, f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
             # Handle this case - advance position past the end
             self.current_position = len(self.tokens) 
             return self.next_batch() # Recursively call to advance to the next shard/epoch properly
@@ -118,6 +121,7 @@ class FineTuneDataLoader:
         self.total_size = len(self.tokens)
         if master_process:
             print(f"Fine-tuning dataset loaded with {self.total_size} tokens.")
+            log_to_file(print_log_file, f"Fine-tuning dataset loaded with {self.total_size} tokens.")
         # Initialize current position based on rank
         self.current_position = self.B * self.T * self.process_rank
 
@@ -283,6 +287,8 @@ if __name__ == "__main__":
     DDP launch: torchrun --standalone --nproc_per_node=NUM_GPUS training.py
     """
 
+    print_log_file = os.path.join(log_dir, f"print_log.txt")
+
     # Setting up DDP
     # torchrun command sets the env vars RANK, LOCAL_RANK and WORLD_SIZE
     # RANK is the global rank of the process, LOCAL_RANK is the local rank of the process on the node, and WORLD_SIZE is the total number of processes
@@ -308,6 +314,7 @@ if __name__ == "__main__":
         if torch.cuda.is_available():
             device = "cuda"
         print(f"Using device: {device}")
+        log_to_file(print_log_file, f"Using device: {device}")
 
     torch.manual_seed(1337 + ddp_rank)
     if torch.cuda.is_available():
@@ -324,7 +331,9 @@ if __name__ == "__main__":
 
     if master_process:
         print(f"total desired batch size: {total_batch_size}")
+        log_to_file(print_log_file, f"total desired batch size: {total_batch_size}")
         print(f"gradient accumulation steps: {grad_accum_steps}")
+        log_to_file(print_log_file, f"gradient accumulation steps: {grad_accum_steps}")
 
     # MODEL INIT
     # adding fake tokens at the end which would never be used by making the vocab size "a nicer number" for more efficient GPU computation (50,257 -> 50,304)
@@ -374,6 +383,7 @@ if __name__ == "__main__":
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
                 log_to_file(log_file, f"step {step} | val_loss: {val_loss_accum.item():.4f}")
+                log_to_file(print_log_file, f"validation loss: {val_loss_accum.item():.4f}")
                 if (step % 5000 == 0 or last_step):
                     # save the model checkpoints
                     checkpoint_path = os.path.join(log_dir, f"checkpoint-{step:05d}.pt")
@@ -387,6 +397,7 @@ if __name__ == "__main__":
                     }
                     torch.save(checkpoint, checkpoint_path)
                     print(f"saved checkpoint to {checkpoint_path}")
+                    log_to_file(print_log_file, f"saved checkpoint to {checkpoint_path}")
                     
         # evaluate hellaswag once in a while
         if step % 250 == 0 or last_step:
@@ -395,6 +406,7 @@ if __name__ == "__main__":
             if master_process:
                 print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
                 log_to_file(log_file, f"{step} hella {acc_norm:.4f}")
+                log_to_file(print_log_file, f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             
         # generate from the model once in a while (except 0, which is noise)
         if step > 0 and step % 250 == 0:
@@ -429,6 +441,7 @@ if __name__ == "__main__":
                 tokens = xgen[i, :max_length].tolist()
                 decoded = enc.decode(tokens)
                 print(f"rank {ddp_rank} sample {i}: {decoded}")
+                log_to_file(print_log_file, f"rank {ddp_rank} sample {i}: {decoded}")
 
         #one step of optimization
         model.train()
@@ -471,6 +484,7 @@ if __name__ == "__main__":
         tokens_per_sec = tokens_processed / dt # tokens per second
         if master_process:
             print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            log_to_file(print_log_file, f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
 
@@ -480,6 +494,7 @@ if __name__ == "__main__":
     # FINE TUNING
     if master_process:
         print("\n--- Starting Fine-tuning Phase ---")
+        log_to_file(print_log_file, "\n--- Starting Fine-tuning Phase ---")
 
     # Loading the fine-tuning dataset
     ft_dataset_train = None
@@ -487,9 +502,11 @@ if __name__ == "__main__":
     # Load dataset only on master process initially to avoid multiple downloads/cache issues
     if master_process:
         print("Loading Anthropic/hh-rlhf dataset...")
+        log_to_file(print_log_file, "Loading Anthropic/hh-rlhf dataset...")
         ft_dataset_train = load_dataset("Anthropic/hh-rlhf", split="train[:80%]")
         ft_dataset_val = load_dataset("Anthropic/hh-rlhf", split="train[80%:]")
         print("Dataset loaded by master process.")
+        log_to_file(print_log_file, "Dataset loaded by master process.")
         # Simple broadcast of the dataset object size to check consistency
         dataset_size = len(ft_dataset_train) if ft_dataset_train else 0
         broadcast_obj = [dataset_size]
@@ -500,24 +517,30 @@ if __name__ == "__main__":
         # Broadcast the dataset size from master (rank 0) to all other processes
         dist.broadcast_object_list(broadcast_obj, src=0)
         dataset_size_from_master = broadcast_obj[0]
-        if master_process: print(f"Broadcasted dataset size: {dataset_size_from_master}")
+        if master_process: 
+            print(f"Broadcasted dataset size: {dataset_size_from_master}")
+            log_to_file(print_log_file, f"Broadcasted dataset size: {dataset_size_from_master}")
 
         # Non-master processes load from cache
         if not master_process and dataset_size_from_master > 0:
             try:
                 print(f"Rank {ddp_rank} loading dataset from cache...")
+                log_to_file(print_log_file, f"Rank {ddp_rank} loading dataset from cache...")
                 ft_dataset_train = load_dataset("Anthropic/hh-rlhf", split="train[:80%]") # Use same split as master process
                 ft_dataset_val = load_dataset("Anthropic/hh-rlhf", split="train[80%:]")
                 # print(f"Rank {ddp_rank} loaded dataset from cache (size: {len(ft_dataset_train)}).")
                 if len(ft_dataset_train) != dataset_size_from_master:
                     print(f"Rank {ddp_rank} Warning: Loaded dataset size ({len(ft_dataset_train)}) differs from master ({dataset_size_from_master})!")
+                    log_to_file(print_log_file, f"Rank {ddp_rank} Warning: Loaded dataset size ({len(ft_dataset_train)}) differs from master ({dataset_size_from_master})!")
                     ft_dataset_train = None # Consider it failed if size mismatch
             except Exception as e:
                 print(f"Rank {ddp_rank} failed to load dataset from cache: {e}.")
+                log_to_file(print_log_file, f"Rank {ddp_rank} failed to load dataset from cache: {e}.")
                 ft_dataset_train = None
 
         elif not master_process and dataset_size_from_master == 0:
             print(f"Rank {ddp_rank}: Master process reported empty dataset. Skipping load.")
+            log_to_file(print_log_file, f"Rank {ddp_rank}: Master process reported empty dataset. Skipping load.")
             ft_dataset_train = None
 
         # Final check: Ensure all processes have a valid dataset object
@@ -525,10 +548,14 @@ if __name__ == "__main__":
         load_success_tensor = torch.tensor(1 if can_finetune else 0, device=device)
         dist.all_reduce(load_success_tensor, op=dist.ReduceOp.MIN) # If any failed (0), result is 0
         if load_success_tensor.item() == 0:
-            if master_process: print("Dataset loading failed or inconsistent across processes. Skipping fine-tuning.")
+            if master_process: 
+                print("Dataset loading failed or inconsistent across processes. Skipping fine-tuning.")
+                log_to_file(print_log_file, "Dataset loading failed or inconsistent across processes. Skipping fine-tuning.")
             can_finetune = False
         else:
-            if master_process: print("Dataset successfully loaded on all processes.")
+            if master_process: 
+                print("Dataset successfully loaded on all processes.")
+                log_to_file(print_log_file, "Dataset successfully loaded on all processes.")
             can_finetune = True
     else:
         # Non-DDP case
@@ -602,12 +629,14 @@ if __name__ == "__main__":
             tokens_per_sec = tokens_processed / dt # tokens per second
             if master_process:
                 print(f"FT step {ft_step:5d} | loss: {loss_accum.item():.6f} | lr {ft_current_lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+                log_to_file(ft_log_file, f"FT step {ft_step:5d} | loss: {loss_accum.item():.6f} | lr {ft_current_lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
                 with open(log_file, "a") as f:
                     f.write(f"{ft_step} ft_train {loss_accum.item():.6f}\n")
 
         # Saving the fine-tuned model
         if master_process:
             print("\n--- Fine-tuning Finished ---")
+            log_to_file(print_log_file, "\n--- Fine-tuning Finished ---")
             final_ft_path = os.path.join(log_dir, "finetuned_final.pt")
             final_ft_checkpoint = {
                 "model": raw_model.state_dict(),
@@ -619,6 +648,7 @@ if __name__ == "__main__":
             }
             torch.save(final_ft_checkpoint, final_ft_path)
             print(f"saved fine-tuned model to {final_ft_path}")
+            log_to_file(print_log_file, f"saved fine-tuned model to {final_ft_path}")
 
     if ddp:
         # destroy the process group
