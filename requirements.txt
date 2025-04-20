@@ -2,3 +2,4 @@ torch>=2.0
 transformers>=4.0
 tiktoken
 numpy
+datasets
