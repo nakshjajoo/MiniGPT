@@ -9,6 +9,7 @@ from transformers import GPT2LMHeadModel
 
 @dataclass
 class GPTConfig:
+    """ GPT-2 model configuration """
     vocab_size: int = 50257 #number of tokens: 256 byte tokens + 50k BPE merges + 1 <|endoftext|> token
     n_embd: int = 768 # embedding dimensionality
     n_layer: int = 12 # number of transformer blocks
@@ -16,6 +17,7 @@ class GPTConfig:
     block_size: int = 2048 # context length
 
 class CausalSelfAttention(nn.Module):
+    """ A standard multi-head masked self-attention layer with a projection at the end. """
 
     def __init__(self, config):
         super().__init__()
@@ -27,7 +29,6 @@ class CausalSelfAttention(nn.Module):
 
         self.c_proj.MINIGPT_SCALE_INIT = 1
 
-        # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
@@ -64,6 +65,7 @@ class CausalSelfAttention(nn.Module):
         return y
     
 class MLP(nn.Module):
+    """ A simple feedforward neural network with one hidden layer and GELU activation. """
 
     def __init__(self, config):
         super().__init__()
@@ -79,6 +81,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
+    """ Transformer block: communication (self-attention) and computation (MLP) """
     
     def __init__(self, config):
         super().__init__()
@@ -93,6 +96,8 @@ class Block(nn.Module):
         return x
 
 class GPT(nn.Module):
+    """ The full GPT language model """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -111,6 +116,13 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        """ 
+        Initialize the weights based on the type of layer 
+        As networks get deeper, the variance of activations or gradients can blow up
+        Prevents deep models from blowing up in the residual path
+        Scale down the init std with depth, to prevent instability
+        """
+
         if isinstance(module, nn.Linear): 
             std = 0.02
             if hasattr(module, 'MINIGPT_SCALE_INIT'):
@@ -195,6 +207,8 @@ class GPT(nn.Module):
         return model
     
     def configure_optimizer(self, weight_decay, learning_rate, device):
+        """ Create fused AdamW optimizer with weight decay for all parameters that are 2D """
+
         # starting with all of the candidate parameters that require gradients
         param_dict = {pname: p for pname, p in self.named_parameters() if p.requires_grad}
 
