@@ -85,6 +85,14 @@ class DataLoader:
         """ Get the next batch of data. Reset the position if we reach the end of the dataset """
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1] # (1 extra token for the next token prediction)
+
+        if len(buf) < B * T + 1:
+            print(f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
+            log_to_file(print_log_file, f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
+            # Handle this case - advance position past the end
+            self.current_position = len(self.tokens) 
+            return self.next_batch() # Recursively call to advance to the next shard/epoch properly
+        
         x = buf[:-1].view(B, T) # (B, T)
         y = buf[1:].view(B, T) # (B, T)
         # advance the position in the tensor
@@ -93,19 +101,12 @@ class DataLoader:
         if self.current_position + (B * T * self.num_processes + 1) >= len(self.tokens):
             # self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.current_shard += 1
-            if self.current_shard_index >= len(self.shards):
+            if self.current_shard >= len(self.shards):
                 # All shards used up — next epoch
                 self.start_new_epoch()
             else:    
                 self.tokens = load_tokens(self.shards[self.current_shard])
                 self.current_position = B * T * self.process_rank
-            
-        if len(buf) < B * T + 1:
-            print(f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
-            log_to_file(print_log_file, f"Warning: Shard {self.shards[self.current_shard]} seems too small for a full batch after reset/advance. Skipping remaining part.")
-            # Handle this case - advance position past the end
-            self.current_position = len(self.tokens) 
-            return self.next_batch() # Recursively call to advance to the next shard/epoch properly
     
         return x, y
 
@@ -161,8 +162,17 @@ class FineTuneDataLoader:
     
     def next_batch(self):
         """ Get the next batch of data. Reset the position if we reach the end of the dataset """
+        
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1] # (1 extra token for the next token prediction)
+
+        if len(buf) < B * T + 1:
+            print(f"Warning: Dataset seems too small for a full batch after reset/advance. Skipping remaining part.")
+            log_to_file(print_log_file, f"Warning: Dataset seems too small for a full batch after reset/advance. Skipping remaining part.")
+            # Handle this case - advance position past the end
+            self.current_position = len(self.tokens) 
+            return self.next_batch()
+        
         x = buf[:-1].view(B, T) # (B, T)
         y = buf[1:].view(B, T) # (B, T)
         # advance the position in the tensor
