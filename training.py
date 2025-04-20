@@ -288,6 +288,9 @@ if __name__ == "__main__":
     """
 
     print_log_file = os.path.join(log_dir, f"print_log.txt")
+    with open(print_log_file, 'w') as f: 
+        # open for writing to clear the file
+        pass
 
     # Setting up DDP
     # torchrun command sets the env vars RANK, LOCAL_RANK and WORLD_SIZE
@@ -319,6 +322,10 @@ if __name__ == "__main__":
     torch.manual_seed(1337 + ddp_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337 + ddp_rank)
+
+    # get the training start time
+    if master_process:
+        start_time = time.time()
 
     # Hyperparameters
     total_batch_size = 524288 #tokens # 2^19, ~ 0.5M tokens 
@@ -491,6 +498,10 @@ if __name__ == "__main__":
     if ddp:
         dist.barrier()
     
+    # get the training end time
+    if master_process:
+        training_end_time = time.time()
+    
     # FINE TUNING
     if master_process:
         print("\n--- Starting Fine-tuning Phase ---")
@@ -649,6 +660,19 @@ if __name__ == "__main__":
             torch.save(final_ft_checkpoint, final_ft_path)
             print(f"saved fine-tuned model to {final_ft_path}")
             log_to_file(print_log_file, f"saved fine-tuned model to {final_ft_path}")
+
+    # get the fine-tuning end time
+    if master_process:
+        finetuning_end_time = time.time()
+        total_training_time = training_end_time - start_time
+        total_finetuning_time = finetuning_end_time - training_end_time
+        total_time = total_training_time + total_finetuning_time
+        print(f"Total training time: {total_training_time:.2f} seconds")
+        print(f"Total fine-tuning time: {total_finetuning_time:.2f} seconds")
+        print(f"Total time: {total_time:.2f} seconds")
+        log_to_file(print_log_file, f"Total training time: {total_training_time:.2f} seconds")
+        log_to_file(print_log_file, f"Total fine-tuning time: {total_finetuning_time:.2f} seconds")
+        log_to_file(print_log_file, f"Total time: {total_time:.2f} seconds")
 
     if ddp:
         # destroy the process group
