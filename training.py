@@ -38,17 +38,17 @@ def load_tokens(filename):
 
 class DataLoader:
     """ Data loader for the fineweb dataset """
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, data_root="edu_fineweb10B"):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.seed = 1337
+        self.data_root = data_root
         self.split = split
         assert split in {'train', 'val'}
 
         #get the shard filenames
-        data_root = "edu_fineweb10B"
         all_shards = os.listdir(data_root)
         all_shards = [s for s in all_shards if split in s]
         all_shards = sorted(all_shards)
@@ -162,7 +162,7 @@ class FineTuneDataLoader:
     
     def next_batch(self):
         """ Get the next batch of data. Reset the position if we reach the end of the dataset """
-        
+
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1] # (1 extra token for the next token prediction)
 
@@ -374,10 +374,12 @@ if __name__ == "__main__":
     val_loader = DataLoader(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
     torch.set_float32_matmul_precision('high')
 
-    max_lr = 15e-4 # 6e-4
+    max_lr = 6e-4
     min_lr = max_lr * 0.1 # 10% of max_lr
     warmup_steps = 715 # 375M tokens / (2^19) tokens per step (375M tokens were used for warmup in the original paper)
 
+
+    scaler = torch.cuda.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu")
     # configure the optimizer
     optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
     enc = tiktoken.get_encoding("gpt2")
@@ -426,7 +428,7 @@ if __name__ == "__main__":
                 log_to_file(print_log_file, f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             
         # generate from the model once in a while (except 0, which is noise)
-        if step > 0 and step % 250 == 0:
+        if (step > 0 and step % 250 == 0) or last_step:
             raw_model.eval()
             num_return_sequences = 4
             max_length = 32
@@ -480,7 +482,8 @@ if __name__ == "__main__":
             loss_accum += loss.detach()
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # only sync gradients on the last micro step
-            loss.backward() #since we are not doing torch.zero_grad(), this accumulates the gradients
+            # loss.backward() # since we are not doing torch.zero_grad(), this accumulates the gradients
+            scaler.scale(loss).backward() # scale the loss for mixed precision training
 
         if ddp:
             # sync the gradients across all processes
@@ -493,7 +496,9 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        optimizer.step()
+        # optimizer.step()
+        scaler.step(optimizer) # unscale the gradients and step the optimizer
+        scaler.update() # update the scale factor for the next iteration
         torch.cuda.synchronize() if device == "cuda" else None
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
@@ -514,8 +519,8 @@ if __name__ == "__main__":
     
     # FINE TUNING
     if master_process:
-        print("\n--- Starting Fine-tuning Phase ---")
-        log_to_file(print_log_file, "\n--- Starting Fine-tuning Phase ---")
+        print("\nStarting Fine-tuning Phase ")
+        log_to_file(print_log_file, "\nStarting Fine-tuning Phase ")
 
     # Loading the fine-tuning dataset
     ft_dataset_train = None
@@ -586,7 +591,7 @@ if __name__ == "__main__":
         # Setting up fine-tuning Dataloader
         ft_B = ft_batch_size
         assert total_batch_size % (ft_B * T * ddp_world_size) == 0, f"ft_total_batch_size {ft_total_batch_size} must be divisible by ft_B * T * ddp_world_size {ft_B*T*ddp_world_size}"
-        ft_grad_accum_steps = total_batch_size // (ft_B * T * ddp_world_size)
+        ft_grad_accum_steps = ft_total_batch_size // (ft_B * T * ddp_world_size)
 
         ft_loader_train = FineTuneDataLoader(B=ft_B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, data=ft_dataset_train)
         ft_loader_val = FineTuneDataLoader(B=ft_B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, data=ft_dataset_val)
@@ -604,7 +609,7 @@ if __name__ == "__main__":
 
             # evaluate validation loss once in a while
             if ft_step % 10 == 0 or last_step:
-                val_loss_accum = evaluate_validation_loss(model, val_loader, device, use_ddp=ddp)
+                val_loss_accum = evaluate_validation_loss(model, ft_loader_val, device, use_ddp=ddp)
                 if master_process:
                     print(f"fine-tuning validation loss: {val_loss_accum.item():.4f}")
                     log_to_file(ft_log_file, f"ft_step {ft_step} | ft_val_loss: {val_loss_accum.item():.4f}")
@@ -633,7 +638,8 @@ if __name__ == "__main__":
                 loss_accum += loss.detach()
                 if ddp:
                     model.require_backward_grad_sync = (micro_step == ft_grad_accum_steps - 1) # only sync gradients on the last micro step
-                loss.backward()
+                # loss.backward()
+                scaler.scale(loss).backward() # scale the loss for mixed precision training
                 
             if ddp:
                 # sync the gradients across all processes
@@ -641,7 +647,9 @@ if __name__ == "__main__":
 
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             ft_current_lr = optimizer.param_groups[0]['lr']
-            optimizer.step()
+            # optimizer.step()
+            scaler.step(optimizer) # unscale the gradients and step the optimizer
+            scaler.update() # update the scale factor for the next iteration
             
             torch.cuda.synchronize() if device == "cuda" else None
             t1 = time.time()
@@ -656,14 +664,14 @@ if __name__ == "__main__":
 
         # Saving the fine-tuned model
         if master_process:
-            print("\n--- Fine-tuning Finished ---")
-            log_to_file(print_log_file, "\n--- Fine-tuning Finished ---")
+            print("\nFine-tuning Finished ")
+            log_to_file(print_log_file, "\nFine-tuning Finished ")
             final_ft_path = os.path.join(log_dir, "finetuned_final.pt")
             final_ft_checkpoint = {
                 "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": raw_model.config,
-                "step": step,
+                "step": ft_max_steps,
                 # "val_loss": val_loss_accum.item(),
                 "seeds": {"torch": 1337, "generator": 42 + ddp_rank},
             }
