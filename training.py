@@ -4,6 +4,7 @@ import time
 import numpy as np
 import torch
 from torch import nn
+from torch.amp import GradScaler
 from torch.nn import functional as F
 from torch import distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
@@ -379,7 +380,7 @@ if __name__ == "__main__":
     warmup_steps = 715 # 375M tokens / (2^19) tokens per step (375M tokens were used for warmup in the original paper)
 
 
-    scaler = torch.cuda.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = GradScaler("cuda", init_scale=2**16, growth_interval=1000, growth_factor=2.0, enabled=True)
     # configure the optimizer
     optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
     enc = tiktoken.get_encoding("gpt2")
