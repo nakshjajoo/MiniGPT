@@ -4,6 +4,8 @@ A PyTorch reproduction implementation of GPT-style models, focusing on both pre-
 
 The core model `model.py` is a clean implementation of a decoder-only Transformer. The training script `training.py` handles large-scale pre-training on the FineWeb Edu dataset, followed by fine-tuning on conversational data (Anthropic hh-rlhf) using custom special tokens. An interactive command-line interface `inference.py` allows for chatting with the fine-tuned model.
 
+![Screenshot](eval_and_hellaswag_plot.png)
+
 ## Core Features
 
 * **GPT Model:** A standard decoder-only Transformer architecture `model.py` (details below).
