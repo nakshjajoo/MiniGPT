@@ -7,7 +7,7 @@ The core model `model.py` is a clean implementation of a decoder-only Transforme
 ## Core Features
 
 * **GPT Model:** A standard decoder-only Transformer architecture `model.py` (details below).
-* **Pre-training:** Script `training.py` to pre-train the model on 10B tokens of FineWeb Edu dataset. Supports DDP for multi-GPU training, mixed precision (`bfloat16`), gradient accumulation, and multiple optimization techniques.
+* **Pre-training:** Script `training.py` to pre-train the model on 40B tokens of FineWeb Edu dataset. Supports DDP for multi-GPU training, mixed precision (`bfloat16`), gradient accumulation, and multiple optimization techniques.
 * **Fine-tuning:** Integrated fine-tuning phase in `training.py` to adapt the pre-trained model for conversational interface, by fine-tuning using Anthropic's HH-RLHF dataset and custom special tokens (`<|USER|>`, `<|ASSISTANT|>`, `<|END|>`). Easily adaptable to other datasets and formatting.
 * **Conversational Inference:** An interactive command-line chat script `inference.py` that loads the fine-tuned model and allows back-and-forth conversation, managing history and using special tokens for formatting.
 * **Evaluation:** Includes HellaSwag evaluation logic (`hellaswag.py` and integrated into `training.py`) to benchmark model performance on common sense reasoning.
@@ -19,12 +19,12 @@ The core model `model.py` is a clean implementation of a decoder-only Transforme
     * Handles DDP setup.
     * Initializes model, optimizer, and data loaders.
     * Contains the main pre-training loop with validation loss and HellaSwag evaluation.
-    * Contains the subsequent fine-tuning loop using a different dataset and hyperparameters.
+    * Contains the subsequent fine-tuning loop using the Anthropic/hh-rlhf dataset and different set of hyperparameters.
     * Includes `DataLoader` for sharded pre-training data and `FineTuneDataLoader` for conversational data.
     * Manages checkpoint saving.
 * `inference.py`: Provides an interactive command-line interface for chatting with the fine-tuned model, handling conversation history and special tokens.
 * `hellaswag.py`: Utilities for downloading, processing, and evaluating the HellaSwag dataset.
-* `prepare.py` (Assumed): A script (not provided here, but necessary) to download and pre-process raw datasets (like FineWeb) into tokenized shards (`.npy` files) suitable for the `DataLoader`.
+* `fineweb.py`: A script to download and pre-process the FineWeb Dataset into tokenized shards (`.npy` files) suitable for the `DataLoader`.
 * `log/`: Directory where training logs (`log.txt`, `print_log.txt`) and model checkpoints (`.pt` files) are saved.
 
 ## Model Architecture
@@ -36,15 +36,15 @@ The model implemented follows the GPT-2 architecture closely:
 * **Heads:** 12 (`n_head`)
 * **Embedding Size:** 768 (`n_embd`)
 * **Context Length:** 2048 tokens (`block_size`)
-* **Vocabulary Size:** 50304 (`vocab_size`) - Padded GPT-2 vocab to be divisible by a higher power of 2, also accommodates custom fine-tuning tokens.
-* **Normalization:** Layer Normalization applied *before* attention/MLP blocks (Pre-LN).
+* **Vocabulary Size:** 50304 (`vocab_size`) - Padded GPT-2 vocab to be divisible by a higher power of 2 for GPU optimization, also accommodates custom fine-tuning tokens.
+* **Normalization:** Layer Normalization applied before attention/MLP blocks (Pre-LN).
 * **Activation:** GELU.
 * **Attention:** Causal self-attention using PyTorch's `scaled_dot_product_attention`.
 * **Positional Embeddings:** Learned absolute positional embeddings.
 * **Initialization:** Custom initialization (`_init_weights`) with scaling for projection layers.
 * **Weight Sharing:** Input token embeddings and final output projection layer share weights.
 
-This configuration corresponds roughly to the GPT-2 Small (124M parameter) model size, adapted for a larger context window and vocabulary.
+This configuration corresponds roughly to the GPT-2 Small (124M parameter) model size.
 
 ## Training
 
@@ -52,7 +52,7 @@ The `training.py` script handles two distinct phases:
 
 ### Pre-training
 
-* **Dataset:** FineWeb Edu (10 Billion tokens), expected to be pre-processed into shards in the `edu_fineweb10B` directory by `prepare.py`.
+* **Dataset:** FineWeb Edu (40 Billion tokens), expected to be pre-processed into shards by `prepare.py`.
 * **Optimizer:** AdamW (`betas=(0.9, 0.95)`, `eps=1e-8`).
 * **Weight Decay:** 0.1 (applied to weights, not biases/norms).
 * **Learning Rate:** Cosine decay schedule with linear warmup.
@@ -64,7 +64,7 @@ The `training.py` script handles two distinct phases:
     * Micro-Batch Size: 4 (`B`)
     * Sequence Length: 2048 (`T`)
     * Gradient Accumulation Steps: Calculated based on world size (`total_batch_size // (B * T * ddp_world_size)`).
-* **Regularization:** Gradient Clipping (norm 1.0). Dropout is present in the model definition but rates aren't explicitly mentioned in the training script (likely using defaults or GPT-2 standard 0.1 if `model.py` follows nanoGPT).
+* **Regularization:** Gradient Clipping (norm 1.0) and dropout of 0.1.
 * **Mixed Precision:** `bfloat16` via `torch.autocast` and `torch.cuda.amp.GradScaler` (when CUDA is available).
 * **Duration:** Configured for 4 epochs over the 10B token dataset (`max_steps = 19073 * 4`).
 
@@ -77,7 +77,7 @@ The `training.py` script handles two distinct phases:
     * `<|ASSISTANT|>` (ID: 50258)
     * `<|END|>` (ID: 50259) - Marks the end of a turn.
 * **Tokenizer:** A custom `tiktoken` encoding (`gpt2_custom`) is created internally by `FineTuneDataLoader` to handle these special tokens.
-* **Optimizer:** AdamW (re-initialized for fine-tuning).
+* **Optimizer:** AdamW
 * **Learning Rate:** Fixed `ft_lr = 3e-5`.
 * **Batching:**
     * Effective Batch Size: 64 tokens (`ft_total_batch_size`)
@@ -94,20 +94,23 @@ The `training.py` script handles two distinct phases:
 Install the required libraries. A `requirements.txt` file would typically list:
 
 
-torch
-numpy
-tiktoken
-datasets
-transformers # Often a dependency for datasets
-requests # For hellaswag download
-tqdm # For progress bars
+`torch` \
+`numpy` \
+`tiktoken` \
+`datasets` \
+`transformers # Often a dependency for datasets` \
+`requests # For hellaswag download` \
+`tqdm # For progress bars`
 
 
-Install using pip: `pip install -r requirements.txt` (if you create the file) or `pip install torch numpy tiktoken datasets transformers requests tqdm`.
+Install using pip: \
+`pip install -r requirements.txt` \
+or \
+`pip install torch numpy tiktoken datasets transformers requests tqdm`.
 
 ### Data Preparation
 
-1.  **Pre-training Data:** Use a script like `prepare.py` (similar to Karpathy's `fineweb.py`) to download and process the FineWeb dataset (or another large corpus) into tokenized `.npy` shards. Place these shards in a directory named `edu_fineweb10B` (or update the `data_root` variable in `training.py`). Ensure the shards are split into `train` and `val` subsets (e.g., `fineweb_edu_train_00.npy`, `fineweb_edu_val_00.npy`).
+1.  **Pre-training Data:** Used the script `fineweb.py` to download and process the FineWeb dataset into tokenized `.npy` shards. Placed these shards in a directory named `edu_fineweb10B`. Split the shards into `train` and `val` subsets.
 2.  **Fine-tuning Data:** The `Anthropic/hh-rlhf` dataset will be downloaded automatically by the `datasets` library when `training.py` is run for the first time (during the fine-tuning phase).
 
 ### Training
@@ -144,4 +147,4 @@ The script will load the model and enter an interactive loop where you can chat 
 
 
 ### Evaluation
-Validation Loss: Calculated periodically during both pre-training and fine-
+Validation Loss: Calculated periodically during both pre-training and fine-tuning phase.
