@@ -3,3 +3,5 @@ transformers>=4.0
 tiktoken
 numpy
 datasets
+requests
+tqdm
